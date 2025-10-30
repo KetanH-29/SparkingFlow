@@ -1,0 +1,102 @@
+version: '3.7'
+
+# Reusable configuration block for Spark services
+x-spark-common: &spark-common
+  # Spark 3.5.7 - known working tag
+  image: spark:3.5.7-python3
+  volumes:
+    - ./jobs:/opt/spark/jobs
+    - ./data:/opt/spark/data
+  networks:
+    - sparking-flow
+
+services:
+  # 1. Spark Master Service (from your current setup)
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+
+  # 2. Spark Worker Service (from your current setup)
+  spark-worker-a:
+    <<: *spark-common
+    container_name: spark-worker-a
+    depends_on:
+      - spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    ports:
+      - "9091:8080"
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+
+  # --- AIRFLOW COMPONENTS START HERE ---
+
+  # 3. Airflow Metadata Database
+  postgres:
+    image: postgres:16-alpine # Stable, lightweight version
+    container_name: postgres
+    environment:
+      # These variables link to the Airflow services via airflow.env
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "airflow", "-U", "airflow"]
+      timeout: 5s
+      retries: 5
+    networks:
+      - sparking-flow
+
+  # 4. Custom Airflow Webserver (UI)
+  webserver:
+    # Builds the custom image defined in your Dockerfile (Step 2 below)
+    build: .
+    image: sparkingflow-image
+    container_name: airflow-webserver
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy # Wait for the DB to be ready
+    ports:
+      - "8080:8080"
+    volumes:
+      # Critical for DAGs and logs
+      - ./dags:/opt/airflow/dags:rw
+      - ./logs:/opt/airflow/logs:rw
+    env_file:
+      - airflow.env
+    command: webserver
+    networks:
+      - sparking-flow
+
+  # 5. Custom Airflow Scheduler
+  scheduler:
+    build: .
+    image: sparkingflow-image
+    container_name: airflow-scheduler
+    restart: always
+    depends_on:
+      webserver:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./dags:/opt/airflow/dags:rw
+      - ./logs:/opt/airflow/logs:rw
+    env_file:
+      - airflow.env
+    # Command: Migrate DB, Create Admin User, then Start Scheduler
+    command: bash -c "airflow db migrate && airflow users create --username admin --firstname Yu --lastname Spark --role Admin --email admin@example.com --password admin || true && airflow scheduler"
+    networks:
+      - sparking-flow
+
+networks:
+  sparking-flow:
+    driver: bridge
